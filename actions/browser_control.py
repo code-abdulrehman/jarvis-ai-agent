@@ -9,7 +9,10 @@ import platform
 import shutil
 import subprocess
 import threading
+import tempfile
+import uuid
 import webbrowser
+from urllib.parse import urlparse
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -90,6 +93,8 @@ def _normalize_url(url: str) -> str:
     Full URLs pass through unchanged.
     """
     url = url.strip()
+    if url == "about:blank":
+        return url
     # Trailing sentence punctuation is never part of an address, and it arrives
     # more often than anyone would guess: a name lifted out of a sentence brings
     # the full stop with it, and youtube.com/@name./videos opens an error page
@@ -636,7 +641,8 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
 class _BrowserSession:
     """
     A full session for one browser instance.
-    All browsers open on the real profile via launch_persistent_context.
+    Browser actions share one persistent automation context. Existing Chromium
+    sessions can be attached explicitly through a loopback CDP endpoint.
 
     HEADLESS SESSIONS
         The user's own browser is the interesting one, but there are jobs that
@@ -670,6 +676,9 @@ class _BrowserSession:
         # profile had to be used instead. The difference is every sign-in they
         # have, so it is reported rather than only printed.
         self.profile_kind: str = ""
+        self._attached = False
+        self._init_error = None
+        self._screenshot_dir = None
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -680,12 +689,21 @@ class _BrowserSession:
             name=f"BrowserThread-{self.browser_name}",
         )
         self._thread.start()
-        self._ready.wait(timeout=20)
+        if not self._ready.wait(timeout=20):
+            raise RuntimeError("Browser automation initialization timed out")
+        if self._init_error is not None:
+            raise RuntimeError(f"Browser automation could not initialize: {self._init_error}")
 
     def _run_loop(self):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._async_init())
+        try:
+            self._loop.run_until_complete(self._async_init())
+        except Exception as exc:
+            self._init_error = exc
+            self._ready.set()
+            self._loop.close()
+            return
         self._ready.set()
         self._loop.run_forever()
 
@@ -707,7 +725,7 @@ class _BrowserSession:
             asyncio.run_coroutine_threadsafe(self._async_close(), self._loop).result(10)
 
     async def _async_close(self):
-        if self._context:
+        if self._context and not self._attached:
             try:
                 await self._context.close()
             except Exception:
@@ -718,6 +736,10 @@ class _BrowserSession:
             except Exception:
                 pass
         self._context = self._page = None
+        self._attached = False
+        if self._screenshot_dir is not None:
+            self._screenshot_dir.cleanup()
+            self._screenshot_dir = None
 
     async def _adopt_page(self) -> Page:
         """
@@ -725,27 +747,25 @@ class _BrowserSession:
         Instead of opening a new blank tab (about:blank), it adopts that tab —
         so the user never sees an extra blank tab.
         """
-        await asyncio.sleep(0.3)
-        pages = self._context.pages
-        return pages[0] if pages else await self._context.new_page()
+        context = self._context
+        def closed(*args):
+            if self._context is context:
+                self._context = self._page = None
+        context.on("close", closed)
+        pages = context.pages
+        return pages[-1] if pages else await context.new_page()
 
     async def _launch(self):
         """
-        Launches the browser with the real user profile.
+        Launches or reuses the browser's automation profile.
         Does nothing if the context is already open — and relaunches if the one
         it holds is closed, because a context that has been closed (browser
         crash, explicit close, a session that outlived its browser) would
         otherwise answer every later call in exactly the way the user just saw
         from the console: a context that is not None, but not usable.
         """
-        if self._context is not None and not await self._context.is_closed():
+        if self._context is not None:
             return
-        if self._context is not None and await self._context.is_closed():
-            # A closed context is not None, so the guard above let it through
-            # only while it was open; once it closes the next launch has to be
-            # allowed to run again, which means clearing the stale handle first.
-            self._context = None
-            self._page = None
 
         if self._spec is None:
             raise RuntimeError(
@@ -835,42 +855,11 @@ class _BrowserSession:
             + (f" @ {exe}" if exe else "")
         )
 
-        # ASK FIRST, INSTEAD OF WAITING 25 SECONDS TO BE TOLD.
-        #
-        # A Chromium profile can only be open once. If the user already has the
-        # browser running — which is the normal state of a browser — then
-        # launch_persistent_context on their real profile cannot succeed, and
-        # the way it fails is by sitting on the timeout above before raising.
-        # Every "open this page" then cost twenty-five seconds of nothing
-        # before the fallback even started, and the fallback is a profile with
-        # none of their sign-ins in it.
-        #
-        # Whether the browser is running is a question the process table
-        # answers in milliseconds, and core/appidentity was already built to
-        # ask it. Knowing up front turns a long silence into an immediate,
-        # explainable outcome.
-        already = appidentity.running(self.browser_name)
-        if already:
-            print(f"[Browser] {self.browser_name} is already running "
-                  f"({len(already)} processes) — its profile is locked, so the "
-                  f"separate automation profile will be used.")
-        else:
-            try:
-                self._context = await engine_obj.launch_persistent_context(profile, **kwargs)
-                self._page = await self._adopt_page()
-                self.profile_kind = "real"
-                print(f"[Browser] ✅ Launched [{label}] profile={profile}")
-                return
-            except Exception as e:
-                print(f"[Browser] ⚠️  Real profile failed for {label}: {e}")
-
-        # The real profile could not be opened (browser already open / locked
-        # profile / newer Chrome versions block the real profile under
-        # automation). Fall back to a persistent JARVIS automation profile —
-        # accounts logged in here once stay logged in on later sessions too.
-        jarvis_profile = str(Path.home() / ".jarvis_profiles" / self.browser_name)
+        # Modern Chrome blocks automation of its default data directory.
+        # Use one persistent JARVIS profile for every navigation and interaction.
+        jarvis_profile = profile if self.headless else str(
+            Path.home() / ".jarvis_profiles" / self.browser_name / "interactive")
         Path(jarvis_profile).mkdir(parents=True, exist_ok=True)
-        print(f"[Browser] Retrying with JARVIS profile: {jarvis_profile}")
 
         try:
             self._context = await engine_obj.launch_persistent_context(jarvis_profile, **kwargs)
@@ -882,11 +871,43 @@ class _BrowserSession:
             raise RuntimeError(f"Could not launch {self.browser_name}: {e2}") from e2
 
 
+    async def attach(self, endpoint: str) -> str:
+        parsed = urlparse(endpoint)
+        if parsed.scheme not in ("http", "https", "ws", "wss") or parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
+            raise ValueError("Use a loopback Chrome debugging endpoint")
+        if self._context is not None:
+            raise RuntimeError("Close the existing JARVIS browser session before attaching another browser")
+        browser = await self._pw.chromium.connect_over_cdp(endpoint, timeout=5000)
+        if not browser.contexts:
+            raise RuntimeError("Connected browser has no usable context")
+        self._context = browser.contexts[0]
+        self._attached = True
+        self.profile_kind = "attached"
+        self._page = await self._adopt_page()
+        return await self.list_tabs()
+
+    async def list_tabs(self) -> str:
+        await self._launch()
+        rows = []
+        for index, page in enumerate(self._context.pages):
+            rows.append(f"{index}: {await page.title()} | {page.url}" + (" [selected]" if page is self._page else ""))
+        return "\n".join(rows) or "No browser tabs"
+
+    async def switch_tab(self, index: int) -> str:
+        await self._launch()
+        pages = self._context.pages
+        if index < 0 or index >= len(pages):
+            return "Invalid tab index; use list_tabs first"
+        self._page = pages[index]
+        await self._page.bring_to_front()
+        return f"Selected tab {index}: {self._page.url}"
+
     async def _get_page(self) -> Page:
         await self._launch()
         # If somehow page got closed, open a fresh one
         if self._page is None or self._page.is_closed():
-            self._page = await self._context.new_page()
+            pages = self._context.pages
+            self._page = pages[-1] if pages else await self._context.new_page()
             await asyncio.sleep(0.2)
         return self._page
 
@@ -929,19 +950,10 @@ class _BrowserSession:
             # opens in a separate one where they are signed in to nothing —
             # and a Gmail that asks them to log in looks like a broken
             # assistant unless somebody says why.
-            if self.profile_kind == "separate":
-                return outcome.unverified(
-                    "browser_control",
-                    f"the page opened at {result_url}, but "
-                    f"{self.browser_name} was already running so its profile "
-                    f"was locked - this window uses a separate profile where "
-                    f"the user is NOT signed in to anything. Closing "
-                    f"{self.browser_name} first would let their own profile be "
-                    f"used",
-                    opened=result_url, profile="separate")
             return outcome.done("browser_control", opened=result_url,
                                 profile=self.profile_kind or "real",
-                                verified=True)
+                                verified=True,
+                                note="JARVIS automation profile; sign in here if needed" if self.profile_kind == "separate" else "")
         return outcome.failed(
             "browser_control",
             "the page stayed blank - the address may be wrong, or the site may "
@@ -1094,7 +1106,13 @@ class _BrowserSession:
     async def screenshot(self, path: str = None) -> str:
         page = await self._get_page()
         try:
-            save_path = path or str(Path.home() / "Desktop" / "jarvis_screenshot.png")
+            if path:
+                save_path = path
+            else:
+                if self._screenshot_dir is None:
+                    self._screenshot_dir = tempfile.TemporaryDirectory(
+                        prefix="jarvis-browser-", dir="/tmp" if _OS == "Linux" else None)
+                save_path = str(Path(self._screenshot_dir.name) / (uuid.uuid4().hex + ".png"))
             await page.screenshot(path=save_path, full_page=False)
             return f"Screenshot saved: {save_path}"
         except Exception as e:
@@ -1125,8 +1143,9 @@ class _BrowserSession:
             return f"Reload error: {e}"
 
     async def close_browser(self) -> str:
+        attached = self._attached
         await self._async_close()
-        return f"{self.browser_name} closed."
+        return f"{self.browser_name} detached." if attached else f"{self.browser_name} closed."
 
 class _SessionRegistry:
     """Manages all active browser sessions."""
@@ -1263,10 +1282,11 @@ class _SessionRegistry:
         with self._lock:
             sess = self._sessions.pop(browser_name, None)
         if sess:
+            attached = sess._attached
             sess.close()
             if self._active_browser == browser_name:
                 self._active_browser = ""
-            return f"{browser_name} closed."
+            return f"{browser_name} detached." if attached else f"{browser_name} closed."
         # No interactive session for this browser — but a headless automation may
         # be the one that is actually open, so offer closing that instead of
         # reporting "no session" when there plainly is one.
@@ -1382,44 +1402,27 @@ def browser_control(
         _log(player, result)
         return result
 
-    # ── Navigation is ALWAYS native ──────────────────────────────────────────
-    # go_to / search / new_tab open the site in the user's own browser —
-    # their own profile, logged-in accounts and start page; exactly as if the
-    # user had opened it themselves. A controlled window with about:blank never
-    # opens here. The only exception: if an automation flow is already running,
-    # navigation continues in that window (so multi-step tasks aren't split).
+    # Navigation and interaction must use the SAME controlled browser context.
     if action in ("go_to", "search", "new_tab"):
-        if _registry.has(browser):
+        try:
             sess = _registry.get(browser)
-            try:
-                if action == "search":
-                    result = sess.run(sess.search(params.get("query", ""),
-                                                  params.get("engine", "google")))
-                elif action == "new_tab":
-                    result = sess.run(sess.new_tab(params.get("url", "")))
-                else:
-                    result = sess.run(sess.go_to(params.get("url", "")))
-            except concurrent.futures.TimeoutError:
-                result = f"Browser action '{action}' timed out (60s)."
-            except Exception as e:
-                result = f"Browser error ({action}): {e}"
-            _log(player, result)
-            return result
+            if action == "search":
+                result = sess.run(sess.search(params.get("query", ""), params.get("engine", "google")))
+            elif action == "new_tab":
+                result = sess.run(sess.new_tab(params.get("url", "")))
+            else:
+                result = sess.run(sess.go_to(params.get("url", "")))
+        except Exception as exc:
+            result = f"Browser error ({action}): {exc}"
+        _log(player, result)
+        return result
 
-        if action == "search":
-            base    = _SEARCH_ENGINES.get(params.get("engine", "google").lower(),
-                                          _SEARCH_ENGINES["google"])
-            nav_url = base + params.get("query", "").replace(" ", "+")
-        else:
-            nav_url = params.get("url", "").strip()
-
-        result = _open_native(nav_url, browser)
-        # Remembered unless it outright FAILED. `unverified` is now the normal
-        # answer for a native open - the browser does not report back - and
-        # treating that as a problem would stop the automation session ever
-        # resuming the page the user is actually looking at.
-        if nav_url and not result.startswith(f"status={outcome.FAILED} "):
-            _registry.note_native_url(_normalize_url(nav_url))
+    if action == "attach":
+        try:
+            sess = _registry.get(browser or "chrome")
+            result = sess.run(sess.attach(params.get("cdp_url") or "http://127.0.0.1:9222"))
+        except Exception as exc:
+            result = f"Could not attach to browser: {exc}. Existing Chrome must be started with remote debugging and a separate user-data-dir; ordinary Chrome tabs cannot be attached automatically."
         _log(player, result)
         return result
 
@@ -1484,7 +1487,11 @@ def browser_control(
             except Exception as e:
                 print(f"[Browser] Could not resume last page ({last}): {e}")
 
-        if action == "click":
+        if action == "list_tabs":
+            result = sess.run(sess.list_tabs())
+        elif action == "switch_tab":
+            result = sess.run(sess.switch_tab(int(params.get("tab_index", 0))))
+        elif action == "click":
             result = sess.run(sess.click(params.get("selector"), params.get("text")))
         elif action == "type":
             result = sess.run(sess.type_text(
@@ -1543,8 +1550,7 @@ TOOL = {
         "back and forward. Anything happening on a website is this tool - it "
         "reads the page itself, which nothing else in the assistant can do. "
         "THIS TOOL OPENS THE BROWSER ITSELF. Never call open_app for the "
-        "browser first - doing both launches it twice, the second copy on a "
-        "different profile with none of the user's sign-ins. 'Open Chrome and "
+        "browser first. 'Open Chrome and "
         "go to YouTube' is ONE call to this tool. "
         "NEVER INVENT AN ADDRESS. Only pass a url you actually know. Anything "
         "belonging to the user personally - their own channel, profile, "
@@ -1561,10 +1567,14 @@ TOOL = {
         "'click' with a 'selector' needs a CSS selector that is exactly right "
         "for that site's markup, which is not something to guess at; use it "
         "only when the selector is known. "
-        "For a job on a page that takes several steps - open a site, then find "
-        "and click something on it - call 'screen_agent' instead: it plans the "
-        "steps, calls this tool for each of them, and checks after every one "
-        "that it actually worked. "
+        "Use get_text, list_tabs and get_url to inspect browser state directly; "
+        "do not capture the desktop merely to read a web page. list_tabs uses "
+        "zero-based indices; switch_tab selects one. attach connects to an "
+        "existing Chromium debugging endpoint (cdp_url), never an ordinary "
+        "browser without remote debugging. New sessions use a persistent "
+        "JARVIS profile; the user's normal Chrome tabs and logins are separate. "
+        "For multi-step web tasks, continue in this same browser session and "
+        "verify with get_text/get_url after each action. "
         "Headless jobs use action='open_headless' - the same browser, engine and "
         "page protocol, with no window and no person watching; the address goes in "
         "'url', the browser in 'browser', and a named profile in 'profile' when "
@@ -1587,8 +1597,10 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all | open_headless | close_headless | list_profiles | switch_profile"
+                "description": "attach | list_tabs | switch_tab | go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all | open_headless | close_headless | list_profiles | switch_profile"
             },
+            "cdp_url": {"type": "STRING", "description": "Loopback Chrome debugging endpoint for attach; default http://127.0.0.1:9222"},
+            "tab_index": {"type": "INTEGER", "description": "Zero-based tab index from list_tabs"},
             "browser": {
                 "type": "STRING",
                 "description": "Target browser: chrome | edge | firefox | opera | operagx | brave | vivaldi | safari. Omit to use the currently active browser."
