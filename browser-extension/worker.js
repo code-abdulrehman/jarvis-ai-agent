@@ -1,4 +1,4 @@
-let socket=null, selectedTab=null, currentToken=null;
+let socket=null, currentToken=null, observedTabs=[];
 async function status(text){await chrome.storage.local.set({connectionStatus:text});}
 async function connect(){
  const cfg=await chrome.storage.local.get(['profileId','token','bridgePort']);if(!cfg.token)return;
@@ -28,27 +28,80 @@ chrome.runtime.onMessage.addListener((message,sender,reply)=>{
  if(message.action==='connect'){connect().then(()=>reply({ok:true}));return true;}
  if(message.action==='disconnect'){chrome.storage.local.remove('token').then(()=>{if(socket)socket.close();reply({ok:true});});return true;}
 });
+function facts(tab,index){return {id:tab.id,tab_id:String(tab.id),index,window_id:tab.windowId,title:tab.title||'',url:tab.url||'',active:!!tab.active};}
+async function listTabs(){
+ const tabs=await chrome.tabs.query({});observedTabs=tabs.map(t=>t.id);
+ const focused=await chrome.windows.getLastFocused();
+ return tabs.map((tab,index)=>({...facts(tab,index),focused_window:tab.windowId===focused.id,selected:tab.active&&tab.windowId===focused.id}));
+}
 async function activeTab(){
- if(selectedTab!==null){try{return await chrome.tabs.get(selectedTab);}catch{selectedTab=null;}}
- const [tab]=await chrome.tabs.query({active:true,lastFocusedWindow:true});if(!tab)throw Error('No active browser tab');return tab;
+ const [tab]=await chrome.tabs.query({active:true,lastFocusedWindow:true});
+ if(!tab)throw Error('No active browser tab');return tab;
+}
+function matches(tab,query){const text=String(query||'').trim().toLocaleLowerCase();return (tab.title||'').toLocaleLowerCase().includes(text)||(tab.url||'').toLocaleLowerCase().includes(text);}
+async function resolveTab(p,requireTarget=false,allowIndex=false){
+ let tab;
+ const hasId=p.tab_id!==undefined&&p.tab_id!==null&&String(p.tab_id)!=='';
+ const query=String(p.tab_query||'').trim();
+ if(hasId){
+  const raw=String(p.tab_id);if(!/^\d+$/.test(raw))throw Error('Invalid tab_id; use the exact ID from list_tabs');
+  try{tab=await chrome.tabs.get(Number(raw));}catch{throw Error('Target tab no longer exists. Refresh list_tabs; no other tab was used.');}
+ }else if(query||p.expected_url){
+  const tabs=await chrome.tabs.query({});
+  const found=tabs.filter(t=>(!query||matches(t,query))&&(!p.expected_url||t.url===p.expected_url));
+  if(found.length>1)throw Error('Ambiguous tab target: multiple tabs match. Use list_tabs and an exact tab_id with its title or URL.');
+  if(!found.length)throw Error('No tab matches the requested target. Refresh list_tabs.');
+  tab=found[0];
+ }else if(allowIndex&&p.tab_index!==undefined){
+  const index=Number(p.tab_index);
+  if(!Number.isInteger(index)||index<0||index>=observedTabs.length)throw Error('Unknown tab index. Call list_tabs first and prefer tab_id.');
+  try{tab=await chrome.tabs.get(observedTabs[index]);}catch{throw Error('Observed tab no longer exists; refresh list_tabs.');}
+ }else if(p.current_tab===true||!requireTarget){tab=await activeTab();}
+ else throw Error('Specify the target tab_id and tab_query/expected_url, a unique tab_query, or current_tab=true for an explicitly current-tab request.');
+ if(p.current_tab===true&&(hasId||query||p.expected_url)){const current=await activeTab();if(current.id!==tab.id)throw Error('The requested target is not the current tab; refresh list_tabs.');}
+ if(query&&!matches(tab,query))throw Error('Tab ID does not match the requested title or URL; no action was taken.');
+ if(p.expected_url&&tab.url!==p.expected_url)throw Error('Tab URL changed since observation; no action was taken. Refresh list_tabs.');
+ if(requireTarget&&!allowIndex&&hasId&&!query&&!p.expected_url&&p.current_tab!==true)throw Error('For a named tab, include tab_query or expected_url with tab_id to verify the target.');
+ return tab;
+}
+async function closedTabs(){
+ if(!await chrome.permissions.contains({permissions:['sessions']}))throw Error('Allow tab restoration from the JARVIS extension popup first.');
+ return (await chrome.sessions.getRecentlyClosed({maxResults:25})).filter(s=>s.tab).map(s=>({session_id:s.tab.sessionId,title:s.tab.title||'',url:s.tab.url||'',last_modified:s.lastModified}));
 }
 function url(value){const text=String(value||'').trim();const result=new URL(text.includes('://')?text:`https://${text}`);if(!['http:','https:'].includes(result.protocol))throw Error('Only HTTP/HTTPS page navigation is supported');return result.href;}
 async function perform(command,p){
- if(command==='list_tabs')return (await chrome.tabs.query({})).map(t=>({id:t.id,title:t.title,url:t.url,active:t.active,selected:t.id===selectedTab}));
- if(command==='switch_tab'){
-  const tabs=await chrome.tabs.query({});const tab=p.tab_id?tabs.find(t=>t.id===Number(p.tab_id)):tabs[Number(p.tab_index||0)];
-  if(!tab)throw Error('Unknown tab; list_tabs first');selectedTab=tab.id;await chrome.tabs.update(tab.id,{active:true});return {selected:tab.id,url:tab.url};
+ if(command==='list_tabs')return listTabs();
+ if(command==='list_closed_tabs')return closedTabs();
+ if(command==='restore_tab'){
+  const rows=await closedTabs();let found;
+  if(p.session_id)found=rows.filter(t=>t.session_id===p.session_id);
+  else if(p.tab_query)found=rows.filter(t=>matches(t,p.tab_query));
+  else found=rows.slice(0,1);
+  if(!found.length)throw Error('No recently closed tab matches; no unrelated tab was restored.');
+  if(found.length>1)throw Error('Multiple closed tabs match; use list_closed_tabs and an exact session_id.');
+  const restored=await chrome.sessions.restore(found[0].session_id);
+  if(!restored.tab)throw Error('Chrome did not return the restored tab');
+  return {restored:true,...facts(restored.tab),tabs:await listTabs()};
  }
- if(command==='new_tab'){const tab=await chrome.tabs.create({url:p.url?url(p.url):'about:blank'});selectedTab=tab.id;return {id:tab.id,url:tab.pendingUrl||tab.url};}
- const tab=await activeTab();
+ if(command==='switch_tab'){
+  const tab=await resolveTab(p,true,true);await chrome.tabs.update(tab.id,{active:true});await chrome.windows.update(tab.windowId,{focused:true});
+  return {...facts(await chrome.tabs.get(tab.id)),selected:true};
+ }
+ if(command==='new_tab'){const tab=await chrome.tabs.create({url:p.url?url(p.url):'about:blank'});return {...facts(tab),url:tab.pendingUrl||tab.url,tabs:await listTabs()};}
+ const tab=await resolveTab(p,command==='close_tab',false);
+ if(command==='close_tab'){
+  const closed=facts(tab);await chrome.tabs.remove(tab.id);
+  const remaining=await listTabs();
+  if(remaining.some(t=>t.tab_id===String(tab.id)))throw Error('Chrome did not close the requested tab');
+  return {closed:true,...closed,tabs:remaining};
+ }
  if(command==='go_to'||command==='search'){
   const target=command==='search'?`https://www.google.com/search?q=${encodeURIComponent(p.query||'')}`:url(p.url);
   await chrome.tabs.update(tab.id,{url:target});
-  for(let attempt=0;attempt<50;attempt++){await new Promise(resolve=>setTimeout(resolve,200));const state=await chrome.tabs.get(tab.id);if(state.status==='complete'&&!state.pendingUrl)return {url:state.url,title:state.title,tab_id:tab.id,verified:true};}
-  return {navigation_requested:target,tab_id:tab.id,verified:false};
+  for(let attempt=0;attempt<50;attempt++){await new Promise(resolve=>setTimeout(resolve,200));const state=await chrome.tabs.get(tab.id);if(state.status==='complete'&&!state.pendingUrl)return {url:state.url,title:state.title,tab_id:String(tab.id),verified:true};}
+  return {navigation_requested:target,tab_id:String(tab.id),verified:false};
  }
- if(command==='get_url')return {url:tab.url,title:tab.title,tab_id:tab.id};
- if(command==='close_tab'){await chrome.tabs.remove(tab.id);selectedTab=null;return {closed:tab.id};}
+ if(command==='get_url')return {url:tab.url,title:tab.title,tab_id:String(tab.id)};
  if(command==='back'){await chrome.tabs.goBack(tab.id);return {requested:'back'};}
  if(command==='forward'){await chrome.tabs.goForward(tab.id);return {requested:'forward'};}
  if(command==='reload'){await chrome.tabs.reload(tab.id);return {requested:'reload'};}

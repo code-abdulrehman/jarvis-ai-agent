@@ -12,7 +12,7 @@ from memory import config_manager as config
 
 _SINGLETON = None
 _SINGLETON_LOCK = threading.Lock()
-COMMANDS = {'list_tabs','switch_tab','go_to','search','new_tab','close_tab','get_text','get_url',
+COMMANDS = {'list_closed_tabs','restore_tab','list_tabs','switch_tab','go_to','search','new_tab','close_tab','get_text','get_url',
             'click','smart_click','type','smart_type','fill_form','scroll','press','back','forward','reload'}
 
 class BrowserBridge:

@@ -6,6 +6,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from actions import browser_control as m
 class BrowserTests(unittest.TestCase):
+    def setUp(self):
+        # The user's paired profile selection must not affect Playwright tests.
+        from unittest.mock import Mock
+        bridge = Mock()
+        bridge.snapshot.return_value = {'active':'','profiles':[]}
+        patcher = patch('core.browser_bridge.bridge', return_value=bridge)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_about_blank_is_not_rewritten_as_a_domain(self):
         self.assertEqual(m._normalize_url('about:blank'), 'about:blank')
     def test_live_context_reused_without_nonexistent_is_closed(self):

@@ -1,13 +1,32 @@
 {
   "manifest_version": 3,
   "name": "JARVIS Profile Connection",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "minimum_chrome_version": "116",
   "description": "Connect only this browser profile to your local JARVIS workspace.",
-  "permissions": ["storage", "tabs", "scripting", "alarms"],
-  "host_permissions": ["http://127.0.0.1/*"],
-  "optional_host_permissions": ["http://*/*", "https://*/*"],
-  "background": {"service_worker": "worker.js"},
-  "action": {"default_popup": "popup.html"},
-  "content_security_policy": {"extension_pages": "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:* ws://127.0.0.1:*"}
+  "permissions": [
+    "storage",
+    "tabs",
+    "scripting",
+    "alarms"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "worker.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:* ws://127.0.0.1:*"
+  },
+  "optional_permissions": [
+    "sessions"
+  ]
 }

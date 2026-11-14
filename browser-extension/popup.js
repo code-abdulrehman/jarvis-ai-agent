@@ -16,3 +16,7 @@ $('pair').onclick=async()=>{
  }catch(e){$('status').textContent=e.message;}
 };
 $('disconnect').onclick=async()=>{await chrome.runtime.sendMessage({action:'disconnect'});$('status').textContent='Disconnected. Pair again to reconnect.';};
+
+$('restore-permission').onclick=async()=>{
+ try{const granted=await chrome.permissions.request({permissions:['sessions']});$('status').textContent=granted?'Tab restoration allowed.':'Tab restoration was not allowed.';}catch(e){$('status').textContent=e.message;}
+};

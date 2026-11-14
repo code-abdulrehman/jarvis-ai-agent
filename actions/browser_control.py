@@ -704,6 +704,10 @@ class _BrowserSession:
         self._attached = False
         self._init_error = None
         self._screenshot_dir = None
+        self._tabs = {}
+        self._tab_snapshot = []
+        self._closed_tabs = []
+        self._target_required = False
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -761,6 +765,9 @@ class _BrowserSession:
             except Exception:
                 pass
         self._context = self._page = None
+        self._tabs.clear()
+        self._tab_snapshot.clear()
+        self._target_required = False
         self._attached = False
         if self._screenshot_dir is not None:
             self._screenshot_dir.cleanup()
@@ -776,6 +783,9 @@ class _BrowserSession:
         def closed(*args):
             if self._context is context:
                 self._context = self._page = None
+                self._tabs.clear()
+                self._tab_snapshot.clear()
+                self._target_required = False
         context.on("close", closed)
         pages = context.pages
         return pages[-1] if pages else await context.new_page()
@@ -791,6 +801,7 @@ class _BrowserSession:
         """
         if self._context is not None:
             return
+        self._attached = False
 
         if self._spec is None:
             raise RuntimeError(
@@ -911,27 +922,121 @@ class _BrowserSession:
         self._page = await self._adopt_page()
         return await self.list_tabs()
 
-    async def list_tabs(self) -> str:
-        if self._context is None:
-            raise RuntimeError("Browser not connected; navigate with go_to or attach a debugging-enabled browser")
-        rows = []
-        for index, page in enumerate(self._context.pages):
-            rows.append(f"{index}: {await page.title()} | {page.url}" + (" [selected]" if page is self._page else ""))
-        return "\n".join(rows) or "No browser tabs"
+    def _tab_id(self, page) -> str:
+        for identity, existing in self._tabs.items():
+            if existing is page:
+                return identity
+        identity = 'pw-' + uuid.uuid4().hex[:16]
+        self._tabs[identity] = page
+        return identity
 
-    async def switch_tab(self, index: int) -> str:
+    async def _tab_rows(self):
         if self._context is None:
-            raise RuntimeError("Browser not connected; use go_to or attach first")
-        pages = self._context.pages
-        if index < 0 or index >= len(pages):
-            return "Invalid tab index; use list_tabs first"
-        self._page = pages[index]
-        await self._page.bring_to_front()
-        return f"Selected tab {index}: {self._page.url}"
+            raise RuntimeError('Browser not connected; use go_to or attach first')
+        pages = list(self._context.pages)
+        self._tabs = {key: page for key, page in self._tabs.items() if page in pages}
+        rows = []
+        for index, page in enumerate(pages):
+            rows.append({'tab_id': self._tab_id(page), 'index': index,
+                         'title': await page.title(), 'url': page.url,
+                         'selected': page is self._page})
+        self._tab_snapshot = [row['tab_id'] for row in rows]
+        return rows
+
+    async def list_tabs(self) -> str:
+        return outcome.untrusted('browser-tabs', json.dumps(await self._tab_rows(), ensure_ascii=False))
+
+    async def _resolve_tab(self, tab_id=None, tab_query='', expected_url='', current_tab=False, tab_index=None, destructive=False):
+        if self._context is None:
+            raise RuntimeError('Browser not connected; no new window was opened')
+        pages = list(self._context.pages)
+        query = str(tab_query or '').strip().casefold()
+        async def matches(page):
+            return query in (await page.title()).casefold() or query in page.url.casefold()
+        if tab_id is not None and str(tab_id):
+            page = self._tabs.get(str(tab_id))
+            if page is None or page not in pages or page.is_closed():
+                raise RuntimeError('Target tab no longer exists. Refresh list_tabs; no other tab was used.')
+        elif query or expected_url:
+            found = [page for page in pages if (not query or await matches(page)) and (not expected_url or page.url == expected_url)]
+            if len(found) > 1:
+                raise RuntimeError('Ambiguous target: multiple tabs match. Use a tab_id from list_tabs.')
+            if not found:
+                raise RuntimeError('No tab matches the requested target. Refresh list_tabs.')
+            page = found[0]
+        elif tab_index is not None and not destructive:
+            if not isinstance(tab_index, int) or tab_index < 0 or tab_index >= len(self._tab_snapshot):
+                raise RuntimeError('Unknown tab index. Call list_tabs first and prefer tab_id.')
+            identity = self._tab_snapshot[tab_index]
+            page = self._tabs.get(identity)
+            if page is None or page not in pages or page.is_closed():
+                raise RuntimeError('Observed tab no longer exists. Refresh list_tabs.')
+        elif current_tab:
+            focused = []
+            for candidate in pages:
+                try:
+                    if await candidate.evaluate('document.hasFocus()'):
+                        focused.append(candidate)
+                except Exception:
+                    continue
+            if len(focused) != 1:
+                raise RuntimeError('Cannot identify the current tab uniquely. Use list_tabs and a stable tab_id.')
+            page = focused[0]
+        else:
+            raise RuntimeError('Specify a target tab_id with tab_query/expected_url, a unique tab_query, or current_tab=true.')
+        if current_tab and (tab_id is not None or query or expected_url or tab_index is not None):
+            current = await self._resolve_tab(current_tab=True)
+            if current is not page:
+                raise RuntimeError('The requested target is not the current tab; refresh list_tabs.')
+        if query and not await matches(page):
+            raise RuntimeError('Tab ID does not match the requested title or URL; no action was taken.')
+        if expected_url and page.url != expected_url:
+            raise RuntimeError('Tab URL changed since observation; refresh list_tabs.')
+        if destructive and tab_id is not None and not query and not expected_url:
+            raise RuntimeError('For a named tab, include tab_query or expected_url with tab_id to verify the target.')
+        return page
+
+    async def select_target(self, parameters):
+        self._page = await self._resolve_tab(**{key: parameters[key] for key in
+            ('tab_id','tab_query','expected_url','current_tab') if key in parameters})
+        self._target_required = True
+
+    async def switch_tab(self, index=None, **target) -> str:
+        page = await self._resolve_tab(tab_index=index, **target)
+        self._page = page
+        self._target_required = True
+        await page.bring_to_front()
+        return outcome.done('browser_control', tab_id=self._tab_id(page), title=await page.title(), url=page.url)
+
+    async def list_closed_tabs(self) -> str:
+        return outcome.untrusted('closed-tabs', json.dumps(self._closed_tabs, ensure_ascii=False))
+
+    async def restore_tab(self, session_id=None, tab_query='') -> str:
+        query = str(tab_query or '').strip().casefold()
+        rows = self._closed_tabs
+        found = ([row for row in rows if row['session_id'] == session_id] if session_id else
+                 [row for row in rows if query in row['title'].casefold() or query in row['url'].casefold()] if query else rows[:1])
+        if len(found) != 1:
+            raise RuntimeError('No unique closed tab matches; use list_closed_tabs and an exact session_id.')
+        await self._launch()
+        row = found[0]
+        page = await self._context.new_page()
+        try:
+            await page.goto(row['url'], wait_until='domcontentloaded', timeout=15000)
+        except Exception:
+            await page.close()
+            raise
+        self._page = page
+        self._target_required = True
+        self._closed_tabs.remove(row)
+        return outcome.done('browser_control', reopened=True, tab_id=self._tab_id(page), url=page.url,
+            session_history_restored=False, note='Playwright reopened the saved URL; Chrome tab history is not restored',
+            tabs=json.dumps(await self._tab_rows(),ensure_ascii=False))
 
     async def _get_page(self) -> Page:
         await self._launch()
-        # If somehow page got closed, open a fresh one
+        if self._target_required and (self._page is None or self._page.is_closed()):
+            raise RuntimeError('Selected tab was closed. Refresh list_tabs; no other tab was used.')
         if self._page is None or self._page.is_closed():
             pages = self._context.pages
             self._page = pages[-1] if pages else await self._context.new_page()
@@ -978,7 +1083,7 @@ class _BrowserSession:
             # and a Gmail that asks them to log in looks like a broken
             # assistant unless somebody says why.
             return outcome.done("browser_control", opened=result_url,
-                                profile=self.profile_kind or "real",
+                                profile=self.profile_kind or "real", tab_id=self._tab_id(page),
                                 verified=True,
                                 note="JARVIS automation profile; sign in here if needed" if self.profile_kind == "separate" else "")
         return outcome.failed(
@@ -1112,23 +1217,31 @@ class _BrowserSession:
         return f"Could not find input: '{description}'"
 
     async def new_tab(self, url: str = "") -> str:
-        page = await self._get_page()
-        ctx  = page.context
-        new  = await ctx.new_page()
+        await self._launch()
+        new = await self._context.new_page()
         self._page = new
+        self._target_required = True
         if url:
             return await self.go_to(url)
-        return "New tab opened."
+        return outcome.done('browser_control', new_tab=True, tab_id=self._tab_id(new), url=new.url)
 
-    async def close_tab(self) -> str:
-        page = self._page
-        if page and not page.is_closed():
-            ctx   = page.context
-            await page.close()
-            pages = ctx.pages
+    async def close_tab(self, tab_id=None, tab_query='', expected_url='', current_tab=False) -> str:
+        page = await self._resolve_tab(tab_id=tab_id, tab_query=tab_query,
+            expected_url=expected_url, current_tab=current_tab, destructive=True)
+        row = {'session_id': 'pw-closed-' + uuid.uuid4().hex[:16],
+               'title': await page.title(), 'url': page.url}
+        identity = self._tab_id(page)
+        await page.close()
+        if not page.is_closed():
+            raise RuntimeError('The requested tab did not close')
+        self._closed_tabs.insert(0,row)
+        del self._closed_tabs[25:]
+        if self._page is page:
+            pages = list(self._context.pages)
             self._page = pages[-1] if pages else None
-            return "Tab closed."
-        return "No active tab to close."
+            self._target_required = False
+        return outcome.done('browser_control', closed=True, tab_id=identity, title=row['title'], url=row['url'],
+                            tabs=json.dumps(await self._tab_rows(),ensure_ascii=False))
 
     async def screenshot(self, path: str = None) -> str:
         page = await self._get_page()
@@ -1201,7 +1314,7 @@ class _SessionRegistry:
             name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
             return name in store
 
-    def existing(self, browser_name: str | None = None):
+    def existing(self, browser_name: str | None = None, require_context: bool = True):
         """Return a connected context only; observation must never launch one."""
         name = browser_name or self._active_browser
         with self._lock:
@@ -1212,7 +1325,7 @@ class _SessionRegistry:
                 connected = [session for session in self._sessions.values()
                              if session._context is not None]
                 session = connected[0] if len(connected) == 1 else None
-            return session if session is not None and session._context is not None else None
+            return session if session is not None and (not require_context or session._context is not None) else None
 
     def note_native_url(self, url: str) -> None:
         self._last_native_url = url
@@ -1376,7 +1489,7 @@ _registry = _SessionRegistry()
 # by nothing else — it exists so that being told "that is not an action" also
 # tells you what the actions ARE.
 _ACTIONS = (
-    "connected_profiles", "select_profile", "attach", "list_tabs", "switch_tab", "go_to", "search", "new_tab", "close_tab",
+    "connected_profiles", "select_profile", "attach", "list_tabs", "switch_tab", "list_closed_tabs", "restore_tab", "go_to", "search", "new_tab", "close_tab",
     "click", "smart_click", "type", "smart_type", "fill_form", "press",
     "scroll", "get_text", "get_url", "screenshot",
     "back", "forward", "reload",
@@ -1435,8 +1548,10 @@ def browser_control(
         return outcome.untrusted('browser-profiles', str(profile_bridge.snapshot()['profiles']))
     if profile_id and params.get('connection') != 'playwright' and action in COMMANDS:
         try:
+            if (action in ('close_tab','restore_tab') or params.get('tab_id') is not None) and not params.get('profile_id'):
+                raise RuntimeError('Include the profile_id returned by list_tabs/list_closed_tabs so no other profile can be targeted.')
             payload = profile_bridge.request(profile_id, action, params)
-            return outcome.untrusted('browser-page', str(payload))
+            return outcome.untrusted('browser-page', json.dumps({'profile_id':profile_id,'action':action,'result':payload}, ensure_ascii=False))
         except Exception as exc:
             return outcome.failed('browser_control', str(exc), profile=profile_id)
     result  = _unknown_action(action)
@@ -1467,6 +1582,8 @@ def browser_control(
     if action in ("go_to", "search", "new_tab"):
         try:
             sess = _registry.get(browser)
+            if action != 'new_tab' and any(key in params for key in ('tab_id','tab_query','expected_url','current_tab')):
+                sess.run(sess.select_target(params))
             if action == "search":
                 result = sess.run(sess.search(params.get("query", ""), params.get("engine", "google")))
             elif action == "new_tab":
@@ -1548,7 +1665,7 @@ def browser_control(
     # New windows are created exclusively by explicit navigation actions.
     if action not in _ACTIONS:
         return _unknown_action(action)
-    sess = _registry.existing(browser)
+    sess = _registry.existing(browser, require_context=action not in ('restore_tab','list_closed_tabs'))
     if sess is None:
         result = outcome.failed(
             "browser_control", "Browser not connected. No new window was opened. "
@@ -1560,10 +1677,12 @@ def browser_control(
         return result
 
     try:
+        if action not in ('list_tabs','switch_tab','close_tab','restore_tab','list_closed_tabs') and any(key in params for key in ('tab_id','tab_query','expected_url','current_tab')):
+            sess.run(sess.select_target(params))
         if action == "list_tabs":
             result = sess.run(sess.list_tabs())
         elif action == "switch_tab":
-            result = sess.run(sess.switch_tab(int(params.get("tab_index", 0))))
+            result = sess.run(sess.switch_tab(params.get('tab_index'), **{key:params[key] for key in ('tab_id','tab_query','expected_url','current_tab') if key in params}))
         elif action == "click":
             result = sess.run(sess.click(params.get("selector"), params.get("text")))
         elif action == "type":
@@ -1584,7 +1703,11 @@ def browser_control(
         elif action == "press":
             result = sess.run(sess.press(params.get("key", "Enter")))
         elif action == "close_tab":
-            result = sess.run(sess.close_tab())
+            result = sess.run(sess.close_tab(**{key:params[key] for key in ('tab_id','tab_query','expected_url','current_tab') if key in params}))
+        elif action == 'list_closed_tabs':
+            result = sess.run(sess.list_closed_tabs())
+        elif action == 'restore_tab':
+            result = sess.run(sess.restore_tab(params.get('session_id'), params.get('tab_query','')))
         elif action == "screenshot":
             result = sess.run(sess.screenshot(params.get("path")))
         elif action == "back":
@@ -1599,7 +1722,7 @@ def browser_control(
     except concurrent.futures.TimeoutError:
         result = f"Browser action '{action}' timed out (60s)."
     except Exception as e:
-        result = f"Browser error ({action}): {e}"
+        result = outcome.failed('browser_control', str(e), action_requested=action)
 
     _log(player, result)
     return result
@@ -1642,7 +1765,17 @@ TOOL = {
         "only when the selector is known. "
         "Use get_text, list_tabs and get_url to inspect browser state directly; "
         "do not capture the desktop merely to read a web page. list_tabs uses "
-        "zero-based indices; switch_tab selects one. Read/interaction actions "
+        "stable opaque tab_id values. For a named tab, prefer close_tab with "
+        "its observed tab_id plus tab_query (the user's requested title/site) "
+        "or expected_url. A unique tab_query alone can resolve a tab; ambiguity "
+        "fails. Never close a named tab by position or an assumed current tab. "
+        "current_tab=true is only for an explicitly current-tab request. "
+        "Pass profile_id from list_tabs when controlling a paired profile. "
+        "After close/restore, use the returned updated tab list and new IDs; "
+        "never reuse a closed ID. list_closed_tabs/restore_tab recover an exact "
+        "session_id; normal Chrome needs optional tab-restoration permission. "
+        "Playwright recovery only reopens the saved URL, not full tab history. "
+        "switch_tab selects an observed identity. Read/interaction actions "
         "never open a window when no browser is connected. A browser_not_connected "
         "or debug_endpoint_unavailable result is a failure: do not retry attach "
         "without a new debugging endpoint. When the user asks about their "
@@ -1668,20 +1801,24 @@ TOOL = {
         "that the page is up. 'failed' means nothing happened."
     ),
     "brief": (
-        "Controls the web browser: open a URL, navigate, click, read the page."
+        "Browser page/tab control. list_tabs returns stable IDs; close_tab requires tab_id plus tab_query/expected_url, never guessed positions. Recovery: list_closed_tabs/restore_tab."
     ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "connected_profiles | select_profile | attach | list_tabs | switch_tab | go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all | open_headless | close_headless | list_profiles | switch_profile"
+                "description": "connected_profiles | select_profile | attach | list_tabs | switch_tab | list_closed_tabs | restore_tab | go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all | open_headless | close_headless | list_profiles | switch_profile"
             },
             "profile_id": {"type":"STRING", "description":"Paired Chrome profile ID. select_profile chooses it; empty selects Playwright."},
             "connection": {"type":"STRING", "description":"Use playwright to explicitly use the separate JARVIS browser; otherwise the selected paired profile is used."},
-            "tab_id": {"type":"INTEGER", "description":"Actual Chrome tab ID for a paired profile."},
+            "tab_id": {"type":"STRING", "description":"Exact stable opaque tab_id returned by list_tabs, never a positional index. Applies to close, switch, reads, navigation and page actions."},
+            "tab_query": {"type":"STRING", "description":"Short title/site fragment the user requested, e.g. orca.dev. For named close, verify it against tab_id; ambiguous matches fail."},
+            "expected_url": {"type":"STRING", "description":"Exact observed tab URL to guard against a stale or wrong target."},
+            "current_tab": {"type":"BOOLEAN", "description":"True only when the user explicitly asked for the currently active tab; never use for a named tab."},
+            "session_id": {"type":"STRING", "description":"Exact closed session ID from list_closed_tabs for restore_tab."},
             "cdp_url": {"type": "STRING", "description": "Loopback Chrome debugging endpoint for attach; default http://127.0.0.1:9222"},
-            "tab_index": {"type": "INTEGER", "description": "Zero-based tab index from list_tabs"},
+            "tab_index": {"type": "INTEGER", "description": "Legacy switch_tab only: position in the last observed list. Prefer stable tab_id; never use an index for closing."},
             "browser": {
                 "type": "STRING",
                 "description": "Target browser: chrome | edge | firefox | opera | operagx | brave | vivaldi | safari. Omit to use the currently active browser."
