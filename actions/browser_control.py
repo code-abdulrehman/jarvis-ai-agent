@@ -1376,7 +1376,7 @@ _registry = _SessionRegistry()
 # by nothing else — it exists so that being told "that is not an action" also
 # tells you what the actions ARE.
 _ACTIONS = (
-    "attach", "list_tabs", "switch_tab", "go_to", "search", "new_tab", "close_tab",
+    "connected_profiles", "select_profile", "attach", "list_tabs", "switch_tab", "go_to", "search", "new_tab", "close_tab",
     "click", "smart_click", "type", "smart_type", "fill_form", "press",
     "scroll", "get_text", "get_url", "screenshot",
     "back", "forward", "reload",
@@ -1418,6 +1418,27 @@ def browser_control(
     params  = parameters or {}
     action  = params.get("action", "").lower().strip()
     browser = params.get("browser", "").lower().strip() or None
+    from core import workspace
+    reason = workspace.denial('browser_control', params)
+    if reason:
+        return outcome.failed('browser_control', reason)
+    from core.browser_bridge import bridge, COMMANDS
+    profile_bridge = bridge()
+    profile_id = str(params.get('profile_id') or profile_bridge.snapshot()['active'])
+    if action == 'select_profile':
+        try:
+            profile_bridge.select(str(params.get('profile_id') or ''))
+            return outcome.done('browser_control', selected=profile_id or 'playwright')
+        except Exception as exc:
+            return outcome.failed('browser_control', str(exc))
+    if action == 'connected_profiles':
+        return outcome.untrusted('browser-profiles', str(profile_bridge.snapshot()['profiles']))
+    if profile_id and params.get('connection') != 'playwright' and action in COMMANDS:
+        try:
+            payload = profile_bridge.request(profile_id, action, params)
+            return outcome.untrusted('browser-page', str(payload))
+        except Exception as exc:
+            return outcome.failed('browser_control', str(exc), profile=profile_id)
     result  = _unknown_action(action)
 
     if action == "switch":
@@ -1654,8 +1675,11 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "attach | list_tabs | switch_tab | go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all | open_headless | close_headless | list_profiles | switch_profile"
+                "description": "connected_profiles | select_profile | attach | list_tabs | switch_tab | go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all | open_headless | close_headless | list_profiles | switch_profile"
             },
+            "profile_id": {"type":"STRING", "description":"Paired Chrome profile ID. select_profile chooses it; empty selects Playwright."},
+            "connection": {"type":"STRING", "description":"Use playwright to explicitly use the separate JARVIS browser; otherwise the selected paired profile is used."},
+            "tab_id": {"type":"INTEGER", "description":"Actual Chrome tab ID for a paired profile."},
             "cdp_url": {"type": "STRING", "description": "Loopback Chrome debugging endpoint for attach; default http://127.0.0.1:9222"},
             "tab_index": {"type": "INTEGER", "description": "Zero-based tab index from list_tabs"},
             "browser": {
