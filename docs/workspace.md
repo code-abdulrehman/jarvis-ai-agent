@@ -60,6 +60,30 @@ input can be unavailable. Results distinguish dispatched events from verified
 navigation; the agent should read the page again to check its work. Website
 access can send page content to the configured model when requested.
 
+### Tab identity and recovery
+
+`list_tabs` returns stable `tab_id` values plus title, URL and window context.
+A named `close_tab` targets an exact ID and verifies `tab_query` or
+`expected_url`; a unique title/site query can also resolve the target. Missing,
+ambiguous, stale or mismatched targets fail instead of closing a fallback tab.
+Paired-profile calls include the observed `profile_id`, preventing a later
+profile selection from redirecting a named close. Positional indices are only a
+legacy switch option tied to the last observed list, never a close target.
+
+`current_tab=true` is for an explicitly current-tab request. The extension reads
+the actual active tab, so manual tab changes are not overridden by a stale
+cached selection. Explicit IDs also target page reads and interactions.
+
+For native Chrome recovery, open the extension popup and click **Allow recently
+closed tab restoration** once. `list_closed_tabs` exposes Chrome's recent tab
+sessions; `restore_tab` uses the exact session ID or an unambiguous title/site.
+Restore returns the new tab ID and updated list. Closed IDs never get reused.
+Playwright recovery reopens a URL remembered during this JARVIS session and
+reports that the previous tab's navigation history was not restored.
+
+After this update, reload the extension in `chrome://extensions` and restart
+JARVIS to load the new tool schema. Existing profile pairing stays in place.
+
 **Use separate JARVIS browser** selects the existing Playwright workflow, with a
 separate persistent browser profile. CDP attachment remains available for browsers
 explicitly started with remote debugging.

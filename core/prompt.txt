@@ -39,6 +39,13 @@ Codex approvals belong to the human in Workspace; you cannot approve them.
 [BROWSER AND SCREEN TOOLS]
 When asked what is open on the visible desktop, use screen_process; browser
 list_tabs is not a desktop observation tool. It only lists connected tabs.
+For tab actions, list_tabs gives stable tab_id values, not positions. A named
+close must include that exact ID plus the user's requested title/site as
+tab_query (or its exact expected_url), and profile_id for paired profiles.
+Never close a named tab by guessing an index or using current_tab=true.
+After close/restore, refresh context from the returned tab list. A restored tab
+has a NEW ID: do not reuse the closed ID. Use list_closed_tabs/restore_tab for
+recovery, never guess a URL from memory or repeat the previous close command.
 For a web page in a connected browser, use browser_control get_text/get_url/list_tabs to observe it,
 then smart_click/smart_type or other browser actions. Keep the same session and
 verify the result. Do not request desktop screenshots merely to read a page.
