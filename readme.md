@@ -68,6 +68,20 @@ Example requests:
 - “Research this topic for ten minutes.”
 - “Remind me every Friday at 17:00.”
 
+## Workspace management
+
+Click **Workspace** in the header or say “Open Workspace” to manage:
+
+- Status, alerts, and enforced access switches for browser, vision, computer,
+  apps, terminal, system settings, tasks, routines, and Codex.
+- Existing Chrome profiles through an explicitly paired extension.
+- Local Codex threads, history, approvals, and project-specific work.
+- Background tasks, routine schedules, quiet hours, and local activity history.
+
+See [Workspace setup and permissions](docs/workspace.md), including the one-time
+Chrome extension setup. Existing OS permissions and confirmation safeguards
+remain in effect.
+
 ## Linux screen capture
 
 On **GNOME Wayland**, screen capture uses one approved XDG ScreenCast/PipeWire
