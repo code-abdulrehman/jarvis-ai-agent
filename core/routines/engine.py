@@ -315,6 +315,9 @@ class RoutineEngine:
             return default
 
     def tick(self) -> None:
+        from core.workspace import settings
+        if not settings().get('routines', True):
+            return
         now = self._clock()
         dt = self.local_dt(now)
         ready = bool(self._host("ready", default=False))
@@ -386,6 +389,9 @@ class RoutineEngine:
             self._save()
 
     def _fire(self, r: dict, manual: bool = False) -> str:
+        from core.workspace import settings
+        if not settings().get('routines', True):
+            return 'paused in Workspace'
         kind = r["kind"]
         self._firing.routine = r
         try:

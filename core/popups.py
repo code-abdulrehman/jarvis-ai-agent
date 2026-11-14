@@ -46,6 +46,9 @@ def show(title: str, message: str, urgency: str = "normal") -> bool:
     urgency: "low" | "normal" | "high" — passed to the platform where it exists
     (notify-send's -u). Anything else is folded into "normal".
     """
+    from core.workspace import settings
+    if not settings().get('notifications', True):
+        return False
     title   = str(title or "J.A.R.V.I.S").strip() or "J.A.R.V.I.S"
     message = str(message or "").strip()
     if not message:

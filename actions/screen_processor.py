@@ -212,18 +212,26 @@ def capture_screen() -> tuple[bytes, str]:
     the screen — so the attempt is simply made again before the failure is
     allowed to reach the model. Only a second failure is reported.
     """
+    from core.workspace import require
+    require('vision')
     # X11 tools cannot read GNOME's Wayland desktop. Ask the desktop portal
     # directly, and never repeat a user cancellation/denial automatically.
     if sys.platform.startswith("linux") and (
         os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
         or (not os.environ.get("XDG_SESSION_TYPE") and os.environ.get("WAYLAND_DISPLAY"))
     ):
-        return _compress(_capture_via_portal(), "PNG")
+        frame = _capture_via_portal()
+        require('vision')  # Permission may be revoked while the dialog is open.
+        return _compress(frame, "PNG")
 
     last: Exception | None = None
     for attempt in (1, 2):
         try:
-            return _capture_once()
+            frame = _capture_once()
+            require('vision')
+            return frame
+        except PermissionError:
+            raise
         except Exception as e:
             last = e
             if attempt == 1:
@@ -288,6 +296,8 @@ def _get_camera_index() -> int:
 
 
 def _capture_camera() -> tuple[bytes, str]:
+    from core.workspace import require
+    require('vision')
     if not _CV2:
         raise RuntimeError("OpenCV (cv2) is not installed. Run: pip install opencv-python")
 
@@ -303,6 +313,7 @@ def _capture_camera() -> tuple[bytes, str]:
 
     ret, frame = cap.read()
     cap.release()
+    require('vision')
 
     if not ret or frame is None:
         raise RuntimeError("Camera returned no frame.")

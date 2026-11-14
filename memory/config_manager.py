@@ -686,3 +686,24 @@ def save_providers(mode: str = None, pipeline: dict = None, creds: dict = None,
 
     data["providers"] = block
     _write_config(data)
+
+
+@_locked
+def save_workspace_settings(changes: dict) -> None:
+    data = _read_for_write()
+    data['workspace'] = {**(data.get('workspace') or {}), **changes}
+    _write_config(data)
+
+
+def get_workspace_settings() -> dict:
+    value = load_api_keys().get('workspace')
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def get_browser_connections() -> list:
+    value = load_api_keys().get('workspace_browser_profiles')
+    return list(value) if isinstance(value, list) else []
+
+
+def save_browser_connections(profiles: list) -> None:
+    _patch_config(workspace_browser_profiles=profiles)

@@ -115,6 +115,10 @@ class PluginRegistry:
 
     # -- called by main.py from _execute_tool's else branch --
     def run(self, name: str, parameters: dict, player=None, session_memory=None) -> str:
+        from core import workspace, outcome
+        reason = workspace.denial(name, parameters)
+        if reason:
+            return outcome.failed(name, reason)
         rec = self._plugins.get(name)
         if rec is None or not rec.valid:
             return f"Plugin '{name}' is not available."

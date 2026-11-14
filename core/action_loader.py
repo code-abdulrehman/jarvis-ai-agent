@@ -184,6 +184,11 @@ class ActionRegistry:
         rec = self._actions.get(name)
         if rec is None or not rec.valid:
             return f"Action '{name}' is not available."
+        ctx = {**(ctx or {}), '_tool_name': name}
+        from core import workspace, outcome
+        reason = workspace.denial(name, parameters)
+        if reason:
+            return outcome.failed(name, reason)
         level = self.permission(name)
         if level == "deny":
             return self._permission_denied(name, level)
@@ -230,13 +235,21 @@ def _call_handler(fn: Callable, parameters: dict, ctx: dict) -> str:
     """Invoke the handler passing only the context kwargs it actually declares
     (or all of them if it has **kwargs), so each action's existing signature
     works unchanged."""
+    from core import workspace, outcome
+    name = ctx.get('_tool_name') or getattr(fn, '__name__', '')
+    reason = workspace.denial(name, parameters)
+    if reason:
+        workspace.record('tool', name, 'blocked')
+        return outcome.failed(name, reason)
     sig = inspect.signature(fn)
     has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
     kwargs = {}
     for key in _CTX_KEYS:
         if has_var_kw or key in sig.parameters:
             kwargs[key] = ctx.get(key)
-    return fn(parameters=parameters, **kwargs)
+    result = fn(parameters=parameters, **kwargs)
+    workspace.record('tool', name, 'failed' if 'status=failed' in str(result) else 'completed')
+    return result
 
 
 def _validate(module, filename: str) -> ActionRecord:

@@ -69,6 +69,15 @@ def is_active() -> bool:
 
 
 def stop_capture():
+    # Interrupt a pending portal dialog without waiting for capture_frame's lock.
+    process = _process
+    if process is not None:
+        try:
+            process.stdin.close()
+            process.wait(timeout=0.3)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            try:process.terminate()
+            except ProcessLookupError:pass
     with _lock:
         _stop_locked()
 

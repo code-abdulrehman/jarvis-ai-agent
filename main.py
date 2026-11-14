@@ -722,6 +722,8 @@ class JarvisLive:
         )
         self.ui.get_plugins = self._plugin_registry.list_for_ui
         self.ui.get_plugin_settings = self._plugin_registry.settings_schemas  # ⚙ settings tab
+        from core import workspace as _workspace
+        _workspace.bind_runtime(self.ui)
         self.ui.request_say = self.plugin_say   # plugins: mid-task speech channel
 
         # Tool access for plugins that ORCHESTRATE other tools rather than doing
@@ -1011,6 +1013,9 @@ class JarvisLive:
         )
 
     def _routine_builtin(self, name: str, options: dict) -> None:
+        from core.workspace import settings
+        if not settings().get('spoken_alerts', True):
+            return
         loop = getattr(self, "_loop", None)
         if not loop or not self.session:
             raise RuntimeError("the assistant is not connected")
@@ -1082,6 +1087,9 @@ class JarvisLive:
         exactly like a proactive check-in; Gemini phrases it naturally in the
         user's language. Silently a no-op when no session is connected.
         """
+        from core.workspace import settings
+        if not settings().get('spoken_alerts', True):
+            return
         loop = getattr(self, "_loop", None)
         if not loop or not self.session:
             return
@@ -1593,6 +1601,13 @@ class JarvisLive:
         args = dict(fc.args or {})
 
         print(f"[JARVIS] 🔧 {name}  {args}")
+        from core import workspace, outcome
+        reason = workspace.denial(name, args)
+        if reason:
+            workspace.record('tool', name, 'blocked')
+            return types.FunctionResponse(id=fc.id, name=name,
+                response={'result': outcome.failed(name, reason)})
+        workspace.record('tool', name, 'requested')
         _t_tool = time.monotonic()
         self.ui.set_state("THINKING")
 
