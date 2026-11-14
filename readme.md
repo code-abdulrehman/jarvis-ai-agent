@@ -112,7 +112,10 @@ logins and tabs are separate. Page text and tabs are read through Playwright's
 DOM API, without taking desktop screenshots.
 
 Use `browser_control` actions `list_tabs`, `switch_tab` (zero-based `tab_index`),
-`get_text`, and `get_url` to inspect the controlled browser. Use `attach` with a
+`get_text`, and `get_url` to inspect the controlled browser. Inspection and
+interaction never launch a blank browser when disconnected: use `go_to` to
+explicitly open a site first. A missing debugging endpoint is reported as a
+failure, without creating a session or retrying automatically. Use `attach` with a
 loopback `cdp_url` to connect an existing Chromium browser that was deliberately
 started with remote debugging. For example, on Linux:
 
