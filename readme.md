@@ -70,10 +70,22 @@ Example requests:
 
 ## Linux screen capture
 
-On **GNOME Wayland**, screen capture uses the XDG Screenshot portal. Allow the
-capture when the desktop presents a permission dialog. Cancellation is reported
-without automatically asking again. Ubuntu's `/usr/bin/python3` must have
-PyGObject (`gi`, Gio, and GLib), and a working desktop portal must be running.
+On **GNOME Wayland**, screen capture uses one approved XDG ScreenCast/PipeWire
+session. Select a monitor and allow sharing once; later captures reuse the stream
+without requesting individual screenshots or their flash animation. The OS
+sharing indicator remains visible. Say “stop screen sharing” to call
+`screen_sharing` with `action=stop`, or stop sharing from the desktop indicator.
+A future capture then requests a new grant.
+
+Ubuntu's `/usr/bin/python3` needs PyGObject, GStreamer introspection, and the
+PipeWire/GStreamer plugins. If missing:
+
+```bash
+sudo apt install python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-pipewire gstreamer1.0-plugins-good
+```
+
+A working desktop portal is also required. No Python package is added to the
+application virtualenv for this integration.
 
 On **Xorg**, capture uses `mss` with screenshot-command fallbacks. GNOME 50 does
 not provide the old GNOME Xorg session; an Xorg-capable desktop such as XFCE is
@@ -92,13 +104,37 @@ On macOS, grant Screen Recording and Accessibility permissions as needed.
 
 Restart JARVIS after updating capture code.
 
+## Browser sessions
+
+Navigation, page reading, clicking, and typing use the same persistent JARVIS
+browser profile. Sign in to that window if needed; ordinary Chrome profile
+logins and tabs are separate. Page text and tabs are read through Playwright's
+DOM API, without taking desktop screenshots.
+
+Use `browser_control` actions `list_tabs`, `switch_tab` (zero-based `tab_index`),
+`get_text`, and `get_url` to inspect the controlled browser. Use `attach` with a
+loopback `cdp_url` to connect an existing Chromium browser that was deliberately
+started with remote debugging. For example, on Linux:
+
+```bash
+google-chrome --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir="$HOME/.jarvis_profiles/chrome-debug"
+```
+
+Then attach to `http://127.0.0.1:9222`. This opens a separate profile; it does not
+expose tabs from an ordinary Chrome window. Modern Chrome requires a non-default
+user data directory for remote debugging. Detaching JARVIS leaves an externally
+launched debugging browser running.
+
 ## Screenshot storage and data handling
 
 - On Linux, command-based screenshot fallbacks use a private
   `/tmp/jarvis-capture-…/` directory. Files are removed after reading, including
   normal failure paths; JARVIS does not write these captures to Desktop.
-- The Wayland portal chooses its screenshot location. JARVIS reads the returned
-  file and deletes it immediately afterward.
+- Wayland ScreenCast frames stay in memory; no screenshot file is created.
+  The shared stream stays active until stopped, revoked, or JARVIS exits.
+- Browser screenshots requested without a path use a temporary
+  `jarvis-browser-…` directory and are removed when that browser session closes
+  or the process exits. An explicitly requested save path is respected.
 - `mss` frames and images awaiting analysis are held in memory. Captures are not
   intentionally archived for the session. An abrupt process termination can
   interrupt cleanup of temporary files.
