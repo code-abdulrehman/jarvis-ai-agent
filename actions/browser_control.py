@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import importlib.util
+import http.client
+import json
 import os
 import platform
 import shutil
@@ -638,6 +640,29 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
             "no browser on this system could be opened", url=url)
 
 
+def _check_cdp_endpoint(endpoint: str) -> str:
+    """Check a requested loopback endpoint before creating a Playwright session."""
+    parsed = urlparse(endpoint)
+    if parsed.scheme not in ("http", "https", "ws", "wss") or parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
+        raise ValueError("Use a loopback Chrome debugging endpoint")
+    if parsed.username or parsed.password:
+        raise ValueError("Debugging endpoints must not contain credentials")
+    if parsed.scheme in ("http", "https"):
+        connection_type = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+        connection = connection_type(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80), timeout=1)
+        try:
+            connection.request("GET", "/json/version")
+            response = connection.getresponse()
+            if response.status != 200:
+                raise RuntimeError("The endpoint is not a Chrome debugging server")
+            data = json.loads(response.read(65536))
+            if not data.get("webSocketDebuggerUrl"):
+                raise RuntimeError("The endpoint does not expose a browser debugger")
+        finally:
+            connection.close()
+    return endpoint
+
+
 class _BrowserSession:
     """
     A full session for one browser instance.
@@ -827,7 +852,7 @@ class _BrowserSession:
             profile = str(headless_root / (self.profile_name or "default"))
             headless_root.mkdir(parents=True, exist_ok=True)
         else:
-            profile = _real_profile_dir(self.browser_name)
+            profile = ""  # Interactive Chromium uses the JARVIS profile below.
 
         kwargs = {
             "headless":    self.headless,
@@ -887,14 +912,16 @@ class _BrowserSession:
         return await self.list_tabs()
 
     async def list_tabs(self) -> str:
-        await self._launch()
+        if self._context is None:
+            raise RuntimeError("Browser not connected; navigate with go_to or attach a debugging-enabled browser")
         rows = []
         for index, page in enumerate(self._context.pages):
             rows.append(f"{index}: {await page.title()} | {page.url}" + (" [selected]" if page is self._page else ""))
         return "\n".join(rows) or "No browser tabs"
 
     async def switch_tab(self, index: int) -> str:
-        await self._launch()
+        if self._context is None:
+            raise RuntimeError("Browser not connected; use go_to or attach first")
         pages = self._context.pages
         if index < 0 or index >= len(pages):
             return "Invalid tab index; use list_tabs first"
@@ -1174,6 +1201,19 @@ class _SessionRegistry:
             name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
             return name in store
 
+    def existing(self, browser_name: str | None = None):
+        """Return a connected context only; observation must never launch one."""
+        name = browser_name or self._active_browser
+        with self._lock:
+            if name:
+                name = _ALIASES.get(name.lower().strip(), name.lower().strip())
+                session = self._sessions.get(name)
+            else:
+                connected = [session for session in self._sessions.values()
+                             if session._context is not None]
+                session = connected[0] if len(connected) == 1 else None
+            return session if session is not None and session._context is not None else None
+
     def note_native_url(self, url: str) -> None:
         self._last_native_url = url
 
@@ -1336,7 +1376,7 @@ _registry = _SessionRegistry()
 # by nothing else — it exists so that being told "that is not an action" also
 # tells you what the actions ARE.
 _ACTIONS = (
-    "go_to", "search", "new_tab", "close_tab",
+    "attach", "list_tabs", "switch_tab", "go_to", "search", "new_tab", "close_tab",
     "click", "smart_click", "type", "smart_type", "fill_form", "press",
     "scroll", "get_text", "get_url", "screenshot",
     "back", "forward", "reload",
@@ -1418,11 +1458,26 @@ def browser_control(
         return result
 
     if action == "attach":
+        endpoint = str(params.get("cdp_url") or "http://127.0.0.1:9222")
+        try:
+            _check_cdp_endpoint(endpoint)
+        except Exception as exc:
+            result = outcome.failed(
+                "browser_control",
+                "Chrome debugging endpoint is unavailable. Ordinary open Chrome "
+                "does not expose its tabs to Playwright. Start a separate Chrome "
+                "debugging profile before attaching, or explicitly open a site "
+                "in the JARVIS browser with go_to. Use screen_process only to "
+                "inspect the visible desktop; it does not grant browser tab control.",
+                code="debug_endpoint_unavailable", endpoint=endpoint,
+                detail=str(exc)[:200], retry=False)
+            _log(player, result)
+            return result
         try:
             sess = _registry.get(browser or "chrome")
-            result = sess.run(sess.attach(params.get("cdp_url") or "http://127.0.0.1:9222"))
+            result = sess.run(sess.attach(endpoint))
         except Exception as exc:
-            result = f"Could not attach to browser: {exc}. Existing Chrome must be started with remote debugging and a separate user-data-dir; ordinary Chrome tabs cannot be attached automatically."
+            result = outcome.failed("browser_control", str(exc), code="attach_failed", retry=False)
         _log(player, result)
         return result
 
@@ -1468,25 +1523,22 @@ def browser_control(
         _log(player, result)
         return result
 
-    # ── Interactive actions (click/type/read…) ───────────────────────────────
-    # These require a physically controllable browser; the automation window
-    # only opens here, and as soon as it opens it goes to the user's last
-    # navigated page — it doesn't sit on a blank page.
-    try:
-        sess = _registry.get(browser)
-    except Exception as e:
-        result = f"Could not start browser session: {e}"
+    # Inspection/interaction refers to an existing controlled browser only.
+    # New windows are created exclusively by explicit navigation actions.
+    if action not in _ACTIONS:
+        return _unknown_action(action)
+    sess = _registry.existing(browser)
+    if sess is None:
+        result = outcome.failed(
+            "browser_control", "Browser not connected. No new window was opened. "
+            "Use go_to to open a site in JARVIS's browser, or attach after "
+            "starting a debugging-enabled Chrome profile. A screenshot can show "
+            "the visible desktop, but cannot list ordinary Chrome's hidden tabs.",
+            code="browser_not_connected", retry=False)
         _log(player, result)
         return result
 
     try:
-        last = _registry.pop_native_url()
-        if last:
-            try:
-                sess.run(sess.go_to(last))
-            except Exception as e:
-                print(f"[Browser] Could not resume last page ({last}): {e}")
-
         if action == "list_tabs":
             result = sess.run(sess.list_tabs())
         elif action == "switch_tab":
@@ -1569,7 +1621,12 @@ TOOL = {
         "only when the selector is known. "
         "Use get_text, list_tabs and get_url to inspect browser state directly; "
         "do not capture the desktop merely to read a web page. list_tabs uses "
-        "zero-based indices; switch_tab selects one. attach connects to an "
+        "zero-based indices; switch_tab selects one. Read/interaction actions "
+        "never open a window when no browser is connected. A browser_not_connected "
+        "or debug_endpoint_unavailable result is a failure: do not retry attach "
+        "without a new debugging endpoint. When the user asks about their "
+        "existing ordinary Chrome, report this access limit; do not open a "
+        "separate browser and present it as their existing tabs. attach connects to an "
         "existing Chromium debugging endpoint (cdp_url), never an ordinary "
         "browser without remote debugging. New sessions use a persistent "
         "JARVIS profile; the user's normal Chrome tabs and logins are separate. "
