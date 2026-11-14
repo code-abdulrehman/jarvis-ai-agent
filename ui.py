@@ -106,6 +106,9 @@ class JarvisUI:
         self.root = _RootShim(self._app)
         self._win.show()
 
+    def show_workspace(self):
+        self._win._workspace_sig.emit()
+
     @property
     def muted(self) -> bool:
         return self._win._muted

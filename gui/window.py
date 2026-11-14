@@ -95,6 +95,7 @@ from gui.widgets import (ArcLogo, CommandFrame, DataRow, HeaderBar, HoloPanel, I
 
 
 class MainWindow(QMainWindow):
+    _workspace_sig  = pyqtSignal()
     _log_sig        = pyqtSignal(str)
     _state_sig      = pyqtSignal(str)
     _content_sig    = pyqtSignal(str, str)   # (title, text) — thread-safe content display
@@ -121,6 +122,8 @@ class MainWindow(QMainWindow):
     def __init__(self, face_path: str):
         super().__init__()
         self._face_path = face_path
+        self._workspace_dialog = None
+        self._workspace_sig.connect(self._open_workspace)
 
         # Load customization from config
         _cfg = _read_full_config()
@@ -1251,6 +1254,10 @@ class MainWindow(QMainWindow):
         self._ctrl_btn.setToolTip("Controls — the everyday switches")
         self._ctrl_btn.clicked.connect(self._toggle_controls)
         lay.addWidget(self._ctrl_btn)
+        self._workspace_btn = QPushButton('Workspace')
+        self._workspace_btn.setToolTip('Connections, access, Codex threads, tasks, routines and history')
+        self._workspace_btn.clicked.connect(self._open_workspace)
+        lay.addWidget(self._workspace_btn)
         lay.addStretch()
 
         self._state_chip = StateChip()
@@ -1276,6 +1283,14 @@ class MainWindow(QMainWindow):
         self._fs_btn.clicked.connect(self._toggle_fullscreen)
         lay.addWidget(self._fs_btn)
         return w
+
+    def _open_workspace(self):
+        from gui.workspace_panel import WorkspaceDialog
+        if self._workspace_dialog is None:
+            self._workspace_dialog = WorkspaceDialog(self)
+        self._workspace_dialog.show()
+        self._workspace_dialog.raise_()
+        self._workspace_dialog.activateWindow()
 
     def _tick_clock(self):
         self._clock_lbl.setText(time.strftime("%H:%M:%S"))
