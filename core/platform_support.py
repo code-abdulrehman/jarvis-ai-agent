@@ -1,42 +1,7 @@
-"""
-core/platform_support.py — what this particular machine can actually let the
-assistant do, and what it cannot.
+"""Report OS-level input limits separately from portal and browser access.
 
-WHY THIS EXISTS
-    "It doesn't work properly on Linux" and "it's bad on macOS" were reported
-    for a long time without anybody being able to say WHICH part failed. The
-    answer turns out to be the same in both cases, and it is not a bug in any
-    one file: on some systems the operating system refuses to let any program
-    drive the keyboard, the mouse or the screen, and everything built on top of
-    that then fails silently.
-
-    LINUX / WAYLAND
-        Wayland is the default session on Ubuntu 22.04 and later, on Fedora,
-        and on current GNOME and KDE. It has no equivalent of X11's "any client
-        may synthesise input anywhere" — that was the security hole it was
-        designed to close. So `pyautogui` cannot type or click, `mss` cannot
-        capture the screen, and `xdotool` and `wmctrl` do nothing. None of them
-        raises: they return success and have no effect, which is the worst
-        possible failure and precisely why this reads as "the assistant is
-        broken" rather than "the platform does not permit this".
-
-    macOS / PERMISSIONS
-        Driving the keyboard needs Accessibility, and capturing the screen
-        needs Screen Recording. Both are off until the user grants them in
-        System Settings, and until then the same APIs return success and do
-        nothing.
-
-WHAT THIS MODULE DOES ABOUT IT
-    It does not fix any of that — none of it is fixable from inside the app.
-    It makes it VISIBLE: the limits are reported to the user in the activity
-    log, and, more importantly, to the MODEL through `_describe_limits`, so the
-    assistant says "I can't drive the screen in this session, because Wayland
-    does not allow it" instead of cheerfully reporting a click that never
-    happened.
-
-    That is the same rule the rest of this release follows: never claim an
-    outcome that was not observed. A platform that forbids the action is just
-    another thing that was not observed.
+Wayland blocks the legacy global input APIs used here, while approved portal
+screen sharing and Playwright browser DOM actions remain available.
 """
 from __future__ import annotations
 
@@ -118,19 +83,14 @@ def detect() -> Support:
         return support
 
     if session == "wayland":
-        # The whole point of Wayland is that one client cannot drive another.
-        # XWayland covers apps that ask for X11, but synthetic input into
-        # native Wayland windows is not available to us at all.
         support.can_control_input = False
-        support.can_capture_screen = False
+        support.can_capture_screen = True  # Portal consent/dependencies checked at capture.
         support.can_focus_windows = False
         support.notes.append(
-            "This is a Wayland session, which does not let one program type, "
-            "click, capture the screen or raise another program's window — by "
-            "design, not by fault. Opening applications, files, the web, "
-            "memory and the whole voice pipeline are unaffected. Logging out "
-            "and choosing an Xorg session at the login screen restores the "
-            "rest."
+            "Wayland: screen capture uses a user-approved ScreenCast portal "
+            "session. Keyboard/mouse control of arbitrary desktop apps is "
+            "unavailable through the legacy input tools. Browser page reading "
+            "and interaction through browser_control still work."
         )
         return support
 
@@ -155,10 +115,11 @@ def describe_for_model(support: Support) -> list[str]:
     lines: list[str] = []
     if not support.can_control_input:
         lines.append(
-            "- You CANNOT type, click, press keys or move the mouse in this "
-            "session: this operating system does not permit one program to "
-            "drive another. Do not attempt it and do not report having done "
-            "it — say plainly that this machine does not allow it.")
+            "- Global keyboard/mouse automation of arbitrary desktop apps is "
+            "unavailable through the legacy input tools in this session. "
+            "This does NOT prevent browser_control DOM reading, clicking or "
+            "typing inside its controlled browser, or terminal_control shell "
+            "commands. Use those tools when appropriate.")
     if not support.can_capture_screen:
         lines.append(
             "- You CANNOT see the screen in this session, for the same reason. "

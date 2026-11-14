@@ -95,96 +95,11 @@ def _compress(img_bytes: bytes, source_format: str = "PNG") -> tuple[bytes, str]
 
 
 
-# Use Ubuntu's system Python for Gio; the application's virtualenv need not
-# contain PyGObject. This process creates no GUI: the desktop portal owns UI.
-_PORTAL_SCREENSHOT_SCRIPT = r"""
-import sys
-import uuid
-from pathlib import Path
-from urllib.parse import urlparse, unquote
-from gi.repository import Gio, GLib
-
-bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-loop = GLib.MainLoop()
-token = "jarvis_" + uuid.uuid4().hex
-sender = bus.get_unique_name()[1:].replace(".", "_")
-request = "/org/freedesktop/portal/desktop/request/" + sender + "/" + token
-result = {}
-
-def response(conn, sender, path, interface, signal, params):
-    code, values = params.unpack()
-    result.update(code=code, values=values)
-    loop.quit()
-
-def timeout():
-    result["error"] = "Screen capture permission timed out; try again and accept the desktop dialog."
-    loop.quit()
-    return False
-
-subscription = bus.signal_subscribe(
-    "org.freedesktop.portal.Desktop", "org.freedesktop.portal.Request",
-    "Response", request, None, Gio.DBusSignalFlags.NONE, response)
-timer = GLib.timeout_add_seconds(55, timeout)
-try:
-    reply = bus.call_sync(
-        "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
-        "org.freedesktop.portal.Screenshot", "Screenshot",
-        GLib.Variant("(sa{sv})", ("", {
-            "handle_token": GLib.Variant("s", token),
-            "interactive": GLib.Variant("b", False),
-        })), GLib.VariantType.new("(o)"), Gio.DBusCallFlags.NONE, 10000, None)
-    if reply.unpack()[0] != request:
-        raise RuntimeError("Portal returned an unexpected request handle")
-    loop.run()
-    if "error" in result:
-        try:
-            bus.call_sync("org.freedesktop.portal.Desktop", request,
-                "org.freedesktop.portal.Request", "Close", None, None,
-                Gio.DBusCallFlags.NONE, 2000, None)
-        except Exception:
-            pass
-        raise RuntimeError(result["error"])
-    code = result.get("code", 2)
-    if code == 1:
-        raise RuntimeError("Screen capture cancelled or permission denied. Allow JARVIS in the desktop sharing dialog.")
-    if code != 0:
-        raise RuntimeError("Desktop portal could not capture the screen (response %s)." % code)
-    uri = urlparse(result["values"].get("uri", ""))
-    if uri.scheme != "file" or uri.netloc not in ("", "localhost"):
-        raise RuntimeError("Portal returned no local screenshot file")
-    screenshot = Path(unquote(uri.path))
-    try:
-        data = screenshot.read_bytes()
-    finally:
-        # The portal chooses the source location; leave no screenshot behind.
-        screenshot.unlink(missing_ok=True)
-    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
-        raise RuntimeError("Portal returned an invalid PNG screenshot")
-    sys.stdout.buffer.write(data)
-except Exception as exc:
-    print(str(exc), file=sys.stderr)
-    sys.exit(1)
-finally:
-    bus.signal_unsubscribe(subscription)
-    if "error" not in result:
-        GLib.source_remove(timer)
-"""
-
-
 def _capture_via_portal() -> bytes:
-    try:
-        result = subprocess.run(
-            ["/usr/bin/python3", "-c", _PORTAL_SCREENSHOT_SCRIPT],
-            capture_output=True, timeout=70,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"Wayland screenshot portal unavailable: {exc}") from exc
-    if result.returncode != 0:
-        detail = result.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"Wayland screen capture failed: {detail or 'portal helper failed'}")
-    if not result.stdout.startswith(b"\x89PNG\r\n\x1a\n"):
-        raise RuntimeError("Wayland screenshot portal returned no usable PNG")
-    return result.stdout
+    # One approved ScreenCast/PipeWire session supplies frames without the
+    # Screenshot portal's per-capture flash. No image file is created.
+    from core.wayland_capture import capture_frame
+    return capture_frame()
 
 
 def _capture_via_cli() -> bytes:
